@@ -1,0 +1,146 @@
+name: Publish release assets to GitHub Pages
+
+on:
+  release:
+    types: [published, edited, released, prereleased]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-release-assets
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          ASSETS_URL: ${{ github.event.release.assets_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "site/${TAG}"
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${ASSETS_URL}" > assets.json
+
+          asset_count="$(jq 'length' assets.json)"
+          echo "Found ${asset_count} assets for tag ${TAG}"
+
+          if [ "${asset_count}" -eq 0 ]; then
+            echo "No assets on this release, leaving directory empty"
+          else
+            jq -r '.[] | [.url, .name] | @tsv' assets.json | \
+            while IFS=$'\t' read -r url name; do
+              echo "Downloading ${name}"
+              curl -fsSL \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                "${url}" \
+                -o "site/${TAG}/${name}"
+            done
+          fi
+
+      - name: Prepare gh-pages branch
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mkdir pages
+          cd pages
+
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git checkout -B gh-pages origin/gh-pages
+          else
+            git checkout --orphan gh-pages
+          fi
+
+          touch .nojekyll
+          mkdir -p "${TAG}"
+          rsync -a --delete "../site/${TAG}/" "${TAG}/"
+
+      - name: Generate index page
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          cd pages
+
+          {
+            echo '<!doctype html>'
+            echo '<html>'
+            echo '<head>'
+            echo '  <meta charset="utf-8">'
+            echo '  <meta name="viewport" content="width=device-width, initial-scale=1">'
+            echo '  <title>Release files</title>'
+            echo '</head>'
+            echo '<body>'
+            echo '  <h1>Release files</h1>'
+            echo '  <ul>'
+
+            find . -mindepth 1 -maxdepth 1 -type d ! -name '.git' | sed 's#^\./##' | sort -Vr | while read -r dir; do
+              echo "    <li><a href=\"./${dir}/\">${dir}</a></li>"
+            done
+
+            echo '  </ul>'
+            echo '</body>'
+            echo '</html>'
+          } > index.html
+
+          while read -r dir; do
+            {
+              echo '<!doctype html>'
+              echo '<html>'
+              echo '<head>'
+              echo '  <meta charset="utf-8">'
+              echo '  <meta name="viewport" content="width=device-width, initial-scale=1">'
+              echo "  <title>${dir}</title>"
+              echo '</head>'
+              echo '<body>'
+              echo "  <h1>${dir}</h1>"
+              echo '  <ul>'
+
+              find "${dir}" -mindepth 1 -maxdepth 1 -type f | sed "s#^${dir}/##" | sort | while read -r file; do
+                echo "    <li><a href=\"./${file}\">${file}</a></li>"
+              done
+
+              echo '  </ul>'
+              echo '  <p><a href="../">Back</a></p>'
+              echo '</body>'
+              echo '</html>'
+            } > "${dir}/index.html"
+          done < <(find . -mindepth 1 -maxdepth 1 -type d ! -name '.git' | sed 's#^\./##' | sort -Vr)
+
+      - name: Push gh-pages branch
+        run: |
+          set -euo pipefail
+
+          cd pages
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+            exit 0
+          fi
+
+          git commit -m "Publish release assets for ${{ github.event.release.tag_name }}"
+          git push origin gh-pages
